@@ -36,10 +36,15 @@ class CaliberVersionService(BaseModuleService):
             return None, f"{self.ENTITY} {entry_id} 已过期，不能重新启用"
 
         metric_name = entry.get("所属指标", "")
+        metric_uid = entry.get("指标UID", "")
 
-        # 将同指标所有旧版本过期
+        # 将同指标所有旧版本过期：有稳定引用时按 UID 归属，改名不会漏掉旧版本。
         for row in store.rows(self.MODULE):
-            if (row.get("所属指标") == metric_name
+            same_metric = (
+                row.get("指标UID") == metric_uid if metric_uid
+                else row.get("所属指标") == metric_name
+            )
+            if (same_metric
                     and row.get("id") != entry_id
                     and row.get("status") == "已生效"):
                 row["status"] = "已过期"
@@ -50,9 +55,12 @@ class CaliberVersionService(BaseModuleService):
         entry["pending"] = True
         entry["abnormal"] = False
 
-        # 失效相关缓存
-        cache_key_prefix = f"query:{metric_name}"
-        invalidated = store.cache_invalidate_by_prefix(cache_key_prefix)
+        # 失效相关缓存（同时清当前名称与引用对应的缓存前缀）
+        invalidated = store.cache_invalidate_by_prefix(f"query:{metric_name}")
+        metric = store.metric_by_uid(metric_uid) if metric_uid else None
+        if metric and metric.get("指标名称") != metric_name:
+            invalidated += store.cache_invalidate_by_prefix(
+                f"query:{metric.get('指标名称')}")
 
         return entry, f"口径版本 {entry.get('版本号')} 已生效（旧版本已过期，缓存失效 {invalidated} 条）"
 

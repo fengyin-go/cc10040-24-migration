@@ -79,5 +79,40 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 服务指标引用迁移
+
+数据服务早期按展示名称（`关联指标或模型`）关联指标，指标改名或重名时无法确认
+旧服务读的是哪一笔数据。`backend/app/services/service_metric_reference.py` 把存量
+名称关联迁移为稳定指标引用：
+
+- 指标持有稳定身份 `指标UID`（`metric-XXXX`），改名只更新 `历史名称`，身份不变；
+- 迁移后服务保存 `指标UID`，同时保留 `旧名称契约`，旧客户端按名称读字段不受影响；
+- 查询构建器优先按已发布模板的 `指标UID` 解析真实指标，返回 `metric_ref`；
+- 服务调用返回 `contract_name` / `actual_metric_ref` / `metric_name`，
+  两笔调用 `actual_metric_ref` 相同即仍在读同一指标；
+- 分批转换前保存服务配置原值、关联凭据指纹和旧名称契约快照，可按批次回滚并核对；
+- 同名指标无法唯一确定时冻结原值、登记歧义记录并让调用明确报错，处理完毕前不猜测绑定。
+
+页面入口：`http://127.0.0.1:5195/service-reference`。
+
+主要接口：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/cross/service-reference/status` | 迁移进度与批次概览 |
+| POST | `/api/cross/service-reference/migrate-batch?batch_size=1` | 分批转换 |
+| GET | `/api/cross/service-reference/{id}/audit` | 核对名称契约与实际引用 |
+| GET | `/api/cross/service-reference/{id}/resolve` | 解析一次调用会读到哪笔指标 |
+| GET | `/api/cross/service-reference/ambiguities` | 歧义记录（冻结原值） |
+| POST | `/api/cross/service-reference/ambiguities/{id}/resolve?metric_uid=` | 指定目标指标 |
+| POST | `/api/cross/service-reference/batches/{id}/rollback` | 按快照回滚批次 |
+| GET | `/api/cross/service-reference/batches/{id}/verify` | 回滚后核对配置与凭据 |
+| POST | `/api/cross/data-service/{id}/call?metric_name=` | 调用服务（可带旧名称契约） |
+| POST | `/api/cross/metric/{id}/rename?new_name=` | 指标改名（保留稳定引用） |
+
+验收路径：先用旧客户端调用服务 11（唯一匹配）和服务 12（同名歧义），记录实际指标；
+分批转换后把指标 11 改名，重放原请求核对 `actual_metric_ref` 不变；回滚批次 1 后
+重新调用，核对名称契约与实际引用。种子数据见 `backend/app/demo.py`。
+
 领域：数据工程
 子方向：数据分析与数据应用

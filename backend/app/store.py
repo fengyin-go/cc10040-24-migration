@@ -1,15 +1,19 @@
 """内存数据仓库：给每个业务模块准备一份可筛选、可流转的示例数据。
 
 真实项目里这里会换成数据库访问层；当前实现只依赖标准库，保证克隆下来就能起。
-同时提供跨模块查询和数据流处理能力。
+同时提供跨模块查询、数据流处理能力和服务指标引用迁移所需的审计存储。
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import time
 import threading
+from collections import Counter
 from typing import Any
 
 from app.seed import SEED_ROWS
+from app.demo import DEMO_ROWS
 
 
 class Store:
@@ -17,6 +21,13 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 追加演示链路数据（服务指标引用迁移验收用），不改动通用样例。
+        for name, rows in DEMO_ROWS.items():
+            self._tables.setdefault(name, [])
+            existing_ids = {int(row.get("id", 0)) for row in self._tables[name]}
+            self._tables[name].extend(
+                dict(row) for row in rows if int(row.get("id", 0)) not in existing_ids
+            )
         self._id_counters: dict[str, int] = {}
         # Cache layer storage
         self._cache: dict[str, tuple[float, Any]] = {}
@@ -28,6 +39,12 @@ class Store:
         self._anomaly_records: list[dict[str, Any]] = []
         # Recalc history
         self._recalc_history: list[dict[str, Any]] = []
+        # 服务指标引用迁移：转换批次、原配置快照、歧义记录
+        self._migration_batches: list[dict[str, Any]] = []
+        self._service_reference_snapshots: dict[str, dict[str, Any]] = {}
+        self._migration_ambiguities: list[dict[str, Any]] = []
+        # 服务关联凭据（token 等），迁移/回滚期间原样保留，仅以指纹对外展示
+        self._credentials: dict[str, dict[str, Any]] = {}
         # Lock for thread safety
         self._lock = threading.Lock()
 
@@ -83,12 +100,14 @@ class Store:
     # ── Query journal ──
 
     def log_query(self, metric_id: int, operator: str, sql_summary: str,
-                  row_count: int, duration_ms: float, status: str = "正常") -> dict[str, Any]:
+                  row_count: int, duration_ms: float, status: str = "正常",
+                  metric_uid: str = "", metric_name: str = "") -> dict[str, Any]:
         entry = {
             "id": len(self._query_log) + 1,
             "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
             "操作人": operator,
-            "涉及指标": f"metric_{metric_id}",
+            "涉及指标": metric_name or f"metric_{metric_id}",
+            "指标UID": metric_uid,
             "查询语句摘要": sql_summary,
             "返回行数": str(row_count),
             "status": status,
@@ -176,6 +195,96 @@ class Store:
     def recalc_history(self) -> list[dict[str, Any]]:
         return self._recalc_history
 
+    # ── 服务指标引用迁移 ──
+
+    def migration_batches(self) -> list[dict[str, Any]]:
+        return self._migration_batches
+
+    def service_reference_snapshots(self) -> dict[str, dict[str, Any]]:
+        return self._service_reference_snapshots
+
+    def migration_ambiguities(self) -> list[dict[str, Any]]:
+        return self._migration_ambiguities
+
+    def service_credentials(self) -> dict[str, dict[str, Any]]:
+        return self._credentials
+
+    def ensure_metric_identity(self) -> None:
+        """给存量指标补齐稳定身份（指标UID）。
+
+        身份只分配一次，之后改名或出现同名指标都不会重写，
+        因此引用方可以凭 UID 判断两笔请求是否在读同一笔指标。
+        """
+        used = {
+            str(row.get("指标UID")) for row in self.rows("metric_definition")
+            if row.get("指标UID")
+        }
+        for row in self.rows("metric_definition"):
+            if row.get("指标UID"):
+                continue
+            serial = int(row.get("id") or 0)
+            candidate = f"metric-{serial:04d}"
+            while candidate in used:
+                serial += 1
+                candidate = f"metric-{serial:04d}"
+            row["指标UID"] = candidate
+            used.add(candidate)
+
+        # 口径版本按 UID 归属，改名后仍能找回真实指标的口径。
+        metrics_by_name: dict[str, list[dict[str, Any]]] = {}
+        for metric in self.rows("metric_definition"):
+            metrics_by_name.setdefault(str(metric.get("指标名称", "")), []).append(metric)
+        for caliber in self.rows("caliber_version"):
+            if caliber.get("指标UID"):
+                continue
+            candidates = metrics_by_name.get(str(caliber.get("所属指标", "")), [])
+            if len(candidates) == 1:
+                caliber["指标UID"] = candidates[0]["指标UID"]
+
+    def metric_by_uid(self, metric_uid: str) -> dict[str, Any] | None:
+        for row in self.rows("metric_definition"):
+            if row.get("指标UID") == metric_uid:
+                return row
+        return None
+
+    def metrics_by_name(self, metric_name: str) -> list[dict[str, Any]]:
+        """按展示名称找指标。
+
+        先用当前名称精确匹配；没有命中时再查历史名称，这样指标改名后
+        旧客户端或回滚后的存量配置仍能找回同一笔指标。
+        """
+        current = [row for row in self.rows("metric_definition")
+                   if row.get("指标名称") == metric_name]
+        if current:
+            return current
+        return [
+            row for row in self.rows("metric_definition")
+            if metric_name in [str(alias) for alias in (row.get("历史名称") or [])]
+        ]
+
+    def calibers_for_metric(self, metric: dict[str, Any]) -> list[dict[str, Any]]:
+        """优先按 UID 找口径，找不到再退回名称（兼容未迁移的存量数据）。"""
+        metric_uid = metric.get("指标UID")
+        if metric_uid:
+            by_uid = [row for row in self.rows("caliber_version")
+                      if row.get("指标UID") == metric_uid]
+            if by_uid:
+                return by_uid
+        return self.find_by_field("caliber_version", "所属指标",
+                                  metric.get("指标名称", ""))
+
+    def reference_fingerprint(self, payload: dict[str, Any]) -> str:
+        """给引用/历史配置生成稳定指纹，用于核对回滚前后是否为同一份配置。"""
+        material = "|".join(
+            f"{key}={payload.get(key, '')}"
+            for key in ("服务接口ID", "目标类型", "目标ID", "指标UID",
+                        "指标名称快照", "旧名称契约", "关联凭据指纹")
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+    def copy_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(row)
+
     # ── Data artifacts for cross-module consumption ──
 
     def get_metric_data(self, metric_id: int) -> dict[str, Any] | None:
@@ -183,16 +292,20 @@ class Store:
         metric = self.find("metric_definition", metric_id)
         if metric is None:
             return None
+        self.ensure_metric_identity()
+        metric_uid = metric.get("指标UID", "")
+        metric_name = metric.get("指标名称", "")
         return {
             "metric": metric,
-            "calibers": self.find_by_field("caliber_version", "所属指标",
-                                           metric.get("指标名称", "")),
-            "queries": self.find_by_field("query_builder", "关联指标",
-                                          metric.get("指标名称", "")),
+            "calibers": self.calibers_for_metric(metric),
+            "queries": [row for row in self.rows("query_builder")
+                        if row.get("关联指标") == metric_name
+                        or (metric_uid and row.get("指标UID") == metric_uid)],
             "services": [row for row in self.rows("data_service")
-                         if metric.get("指标名称", "") in str(row.get("关联指标或模型", ""))],
+                         if metric_name in str(row.get("关联指标或模型", ""))
+                         or (metric_uid and row.get("指标UID") == metric_uid)],
             "subscriptions": self.find_by_field("data_subscription", "关联指标",
-                                                 metric.get("指标名称", "")),
+                                                 metric_name),
         }
 
     def get_dimension_model_data(self, model_id: int) -> dict[str, Any] | None:

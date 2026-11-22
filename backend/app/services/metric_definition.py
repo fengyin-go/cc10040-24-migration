@@ -54,6 +54,42 @@ class MetricDefinitionService(BaseModuleService):
         store.rows("caliber_version").append(caliber)
         return entry, f"指标已发布并创建口径版本 v1.0"
 
+    def rename_metric(self, entry_id: int, new_name: str,
+                      operator: str = "指标负责人") -> tuple[dict[str, Any] | None, str]:
+        """指标改名：保留稳定身份（指标UID），旧展示名进历史名称。
+
+        改名后迁移过的服务仍通过 UID 读到同一笔指标；未迁移的存量名称
+        也可能通过历史名称找回，不会因为改名被悄悄改绑到别的指标。
+        """
+        store.ensure_metric_identity()
+        metric = store.find(self.MODULE, entry_id)
+        if metric is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在"
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return None, "新指标名称不能为空"
+        old_name = str(metric.get("指标名称", ""))
+        if new_name == old_name:
+            return metric, "指标名称未变化"
+
+        aliases = list(metric.get("历史名称", []) or [])
+        if old_name and old_name not in aliases:
+            aliases.append(old_name)
+        metric["历史名称"] = aliases
+        metric["指标名称"] = new_name
+        metric["名称变更记录"] = list(metric.get("名称变更记录", []) or []) + [{
+            "原名称": old_name,
+            "新名称": new_name,
+            "操作人": operator,
+            "时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }]
+
+        # 名称变了，按名称生成的缓存键要一并失效，避免读到旧名称的结果。
+        invalidated = store.cache_invalidate_by_prefix(f"query:{old_name}")
+        invalidated += store.cache_invalidate_by_prefix(f"query:{new_name}")
+        return metric, (f"指标已从「{old_name}」改名为「{new_name}」，"
+                        f"稳定引用 {metric.get('指标UID')} 不变，缓存失效 {invalidated} 条")
+
     def get_metric_chain(self, entry_id: int) -> dict[str, Any] | None:
         """获取指标完整数据链：指标 -> 口径 -> 查询模板 -> 数据服务。
 
@@ -87,8 +123,8 @@ class MetricDefinitionService(BaseModuleService):
         if metric is None:
             return None, f"{self.ENTITY} {entry_id} 不存在"
 
-        # 查找当前口径
-        calibers = store.find_by_field("caliber_version", "所属指标", metric.get("指标名称", ""))
+        # 查找当前口径（按稳定引用归属，指标改名后仍能找到口径）
+        calibers = store.calibers_for_metric(metric)
         active = [c for c in calibers if c.get("status") == "已生效"]
 
         old_version = active[0].get("版本号", "unknown") if active else "unknown"
@@ -98,6 +134,7 @@ class MetricDefinitionService(BaseModuleService):
         task = {
             "id": task_id,
             "关联指标": metric.get("指标名称", ""),
+            "指标UID": metric.get("指标UID", ""),
             "新口径版本": new_caliber_version,
             "历史时间范围": time_range,
             "重算状态": "待调度",

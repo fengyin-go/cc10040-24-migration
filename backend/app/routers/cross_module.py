@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.store import store
 from app.services.metric_definition import MetricDefinitionService
 from app.services.caliber_version import CaliberVersionService
 from app.services.query_builder import QueryBuilderService
@@ -24,6 +25,7 @@ from app.services.segment_compare import SegmentCompareService
 from app.services.anomaly_detector import AnomalyDetectorService
 from app.services.recalc_engine import RecalcEngineService
 from app.services.field_lineage import FieldLineageService
+from app.services.service_metric_reference import ServiceMetricReferenceService
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块数据流"])
 
@@ -42,6 +44,14 @@ def publish_with_caliber(metric_id: int, caliber_desc: str = "默认计算口径
     """发布指标并自动创建口径版本"""
     svc = MetricDefinitionService()
     result, msg = svc.publish_with_caliber(metric_id, caliber_desc)
+    return {"ok": result is not None, "message": msg, "entry": result}
+
+
+@router.post("/metric/{metric_id}/rename")
+def rename_metric(metric_id: int, new_name: str, operator: str = "指标负责人"):
+    """指标改名：稳定引用（指标UID）不变，旧名进历史名称。"""
+    svc = MetricDefinitionService()
+    result, msg = svc.rename_metric(metric_id, new_name, operator=operator)
     return {"ok": result is not None, "message": msg, "entry": result}
 
 
@@ -68,10 +78,18 @@ def execute_query(template_id: int, operator: str = "系统"):
 
 
 @router.post("/data-service/{api_id}/call")
-def call_data_service(api_id: int, operator: str = "客户端"):
-    """调用数据服务API"""
+def call_data_service(api_id: int, operator: str = "客户端",
+                      metric_name: str | None = None,
+                      metric_ref: str | None = None):
+    """调用数据服务API。
+
+    metric_name 可选：旧客户端继续传原展示名称（名称契约）；
+    metric_ref 可选：迁移后客户端直接传稳定指标引用，优先于名称。
+    两者都不传时使用服务上保留的旧名称契约。返回里带 actual_metric_ref 供核对。
+    """
     svc = DataServiceService()
-    return svc.call_service(api_id, operator=operator)
+    return svc.call_service(api_id, operator=operator, metric_name=metric_name,
+                            metric_ref=metric_ref)
 
 
 @router.get("/data-service/{api_id}/health")
@@ -79,6 +97,99 @@ def service_health(api_id: int):
     """获取服务接口健康状态"""
     svc = DataServiceService()
     return svc.get_service_health(api_id)
+
+
+# ── 服务指标引用迁移 ──
+
+def _migration_service() -> ServiceMetricReferenceService:
+    return ServiceMetricReferenceService()
+
+
+@router.get("/service-reference/status")
+def service_reference_status():
+    """服务指标引用迁移进度：存量、已迁移、冻结歧义、批次概览。"""
+    return _migration_service().migration_status()
+
+
+@router.get("/service-reference/legacy")
+def service_reference_legacy():
+    """仍按展示名称关联的存量服务清单。"""
+    return {"items": _migration_service().list_legacy_services()}
+
+
+@router.get("/service-reference/plan")
+def service_reference_plan(batch_size: int = 1):
+    """查看下一批将被转换的服务（冻结的歧义记录不会进入批次）。"""
+    items = _migration_service().plan_batch(batch_size)
+    return {"batch_size": batch_size, "items": items}
+
+
+@router.post("/service-reference/migrate-batch")
+def migrate_service_reference_batch(batch_size: int = 1, operator: str = "迁移作业"):
+    """按批次把名称引用转换为稳定指标引用。
+
+    唯一匹配 -> 改写为 UID 引用并保留旧名称契约；
+    同名歧义 -> 冻结原值、登记歧义并返回明确故障（ok=false）。
+    """
+    return _migration_service().migrate_batch(batch_size=batch_size, operator=operator)
+
+
+@router.get("/service-reference/{service_id}/audit")
+def audit_service_reference(service_id: int):
+    """核对服务接口：旧名称契约、实际指标引用、口径、模板与转换前快照。"""
+    return _migration_service().audit_service(service_id)
+
+
+@router.get("/service-reference/{service_id}/resolve")
+def resolve_service_reference(service_id: int, metric_name: str | None = None):
+    """解析一次调用会读到的实际指标引用（不执行查询）。"""
+    return _migration_service().resolve_reference(service_id, metric_name)
+
+
+@router.get("/service-reference/ambiguities")
+def list_service_reference_ambiguities(status: str | None = None):
+    """歧义记录列表（冻结原值，供历史配置查证）。"""
+    return {"items": _migration_service().list_ambiguities(status)}
+
+
+@router.post("/service-reference/ambiguities/{ambiguity_id}/resolve")
+def resolve_service_reference_ambiguity(
+    ambiguity_id: int, metric_uid: str, operator: str = "指标负责人",
+):
+    """由指标负责人指定唯一目标 UID，解除冻结并完成转换。"""
+    record, message = _migration_service().resolve_ambiguity(
+        ambiguity_id, metric_uid, operator=operator)
+    return {"ok": record is not None, "message": message, "entry": record}
+
+
+@router.post("/service-reference/batches/{batch_id}/rollback")
+def rollback_service_reference_batch(batch_id: int):
+    """按转换前快照回滚批次，恢复存量配置并保留关联凭据。"""
+    return _migration_service().rollback_batch(batch_id)
+
+
+@router.get("/service-reference/batches/{batch_id}/verify")
+def verify_service_reference_rollback(batch_id: int):
+    """回滚后核对：服务配置与凭据指纹是否回到转换前。"""
+    return _migration_service().verify_rollback(batch_id)
+
+
+@router.get("/service-reference/batches")
+def list_service_reference_batches():
+    """迁移批次历史（含转换前快照位置与回滚时间）。"""
+    return {"items": [
+        {
+            "批次ID": row.get("批次ID"),
+            "执行人": row.get("执行人"),
+            "执行时间": row.get("执行时间"),
+            "计划转换": row.get("计划转换"),
+            "转换成功": row.get("转换成功"),
+            "冻结歧义": row.get("冻结歧义"),
+            "保留凭据": row.get("保留凭据"),
+            "回滚时间": row.get("回滚时间"),
+        }
+        for row in store.migration_batches()
+    ]}
 
 
 @router.post("/cache/invalidate-by-metric/{metric_name}")
